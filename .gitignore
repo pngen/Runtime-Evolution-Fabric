@@ -1,0 +1,57 @@
+# Build trees
+build/
+build-*/
+out/
+install/
+_install/
+cmake-build-*/
+CMakeUserPresets.json
+
+# Visual Studio / MSVC
+.vs/
+*.vcxproj
+*.vcxproj.filters
+*.sln
+*.user
+*.aps
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.lib
+*.exe
+*.dll
+
+# Clang/GCC artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.gcda
+*.gcno
+*.gcov
+
+# Test / runtime debris
+Testing/
+ref-test-tmp/
+*.log
+*.tmp
+*.dmp
+*.state
+*.state.bak
+*.state.tmp
+ref-*.state*
+*.refstate
+last-run.json
+
+# Sanitizer
+asan/
+ubsan/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
