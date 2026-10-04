@@ -49,7 +49,7 @@ membership; business rollout policy unrelated to runtime compatibility; arbitrar
 migration; generic service discovery.
 
 **Adjacent runtimes.** A *Runtime Registry* may describe available components; a *Compatibility
-Registry* may own canonical compatibility facts; *Artifact Fabric* may hold binaries; *Model
+Registry* may own canonical compatibility facts; *[Artifact Fabric](https://github.com/pngen/Artifact-Fabric)* may hold binaries; *Model
 Lifecycle Fabric* governs model-version evolution; *Cluster Fabric* governs cluster composition.
 This fabric consumes those facts and decides whether runtime generations may coexist, communicate,
 migrate state, advance authority, roll back and retire. It does not absorb them.
