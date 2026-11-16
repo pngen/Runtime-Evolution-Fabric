@@ -7,6 +7,9 @@
 // across socket I/O, filesystem I/O, callbacks or joins.
 //
 // Global lock order (highest first):
+//   0. command_mutex_      one mutating command at a time, from its first look
+//                          at the state until its image has been written; held
+//                          across that write, never across socket I/O
 //   1. state_mutex_        durable + dynamic evolution state (leaf for reads of
 //                          the registries, never held across I/O)
 //   2. pending_mutex_      outbound action ledger
@@ -218,6 +221,7 @@ class EvolutionCoordinator {
 
   struct Session;
   struct Event;
+  class CommandScope;
 
   // -- internals ----------------------------------------------------------
   Status load_durable_locked();
@@ -254,6 +258,7 @@ class EvolutionCoordinator {
   [[nodiscard]] StagePreconditions stage_preconditions_locked(const EvolutionPlan& plan) const;
   [[nodiscard]] bool evidence_current_locked(const CompatibilityEdge& edge) const;
   void refresh_worker_authority_locked(const RuntimeComponentId& component);
+  void refresh_all_worker_authority_locked();
   [[nodiscard]] OperationClass derive_operation_class_locked(const RuntimeComponentId& component,
                                                              RuntimeGeneration generation,
                                                              ProtocolGeneration protocol) const;
@@ -273,6 +278,7 @@ class EvolutionCoordinator {
   [[nodiscard]] Status validate_operator(const PeerIdentity& peer) const;
 
   CoordinatorConfig config_;
+  mutable std::mutex command_mutex_{};
   mutable std::mutex state_mutex_{};
 #ifndef NDEBUG
   mutable std::atomic<std::thread::id> state_lock_owner_{};

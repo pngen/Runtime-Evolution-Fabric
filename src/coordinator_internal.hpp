@@ -11,6 +11,35 @@
 #include "ref/coordinator.hpp"
 
 namespace ref {
+
+// One mutating command. Mutating commands are serialized from their first look
+// at the state until their image has been written, so images reach the file in
+// the order the changes were made. A command is also atomic: unless it reaches
+// commit(), the durable state and the action ledger are put back as they were,
+// whether it was refused half way or its image could not be written. A command
+// that reported a failure is therefore never made durable by a later command.
+class EvolutionCoordinator::CommandScope {
+ public:
+  explicit CommandScope(EvolutionCoordinator& coordinator);
+  ~CommandScope();
+  CommandScope(const CommandScope&) = delete;
+  CommandScope& operator=(const CommandScope&) = delete;
+
+  // Records the state the command starts from. Called with the state lock
+  // held, before the command changes anything.
+  void begin_locked();
+  // The command took effect and its image has been written.
+  void commit() noexcept { committed_ = true; }
+
+ private:
+  EvolutionCoordinator* coordinator_;
+  std::unique_lock<std::mutex> serial_;
+  bool armed_{false};
+  bool committed_{false};
+  DurableState durable_{};
+  std::vector<PendingAction> pending_actions_{};
+};
+
 namespace internal {
 
 // Identity of the built-in wire protocol, the built-in component state schema

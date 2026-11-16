@@ -4,6 +4,27 @@
 #include <cstdlib>
 
 namespace ref {
+
+EvolutionCoordinator::CommandScope::CommandScope(EvolutionCoordinator& coordinator)
+    : coordinator_(&coordinator), serial_(coordinator.command_mutex_) {}
+
+void EvolutionCoordinator::CommandScope::begin_locked() {
+  durable_ = coordinator_->durable_;
+  pending_actions_ = coordinator_->pending_actions_;
+  armed_ = true;
+}
+
+EvolutionCoordinator::CommandScope::~CommandScope() {
+  if (!armed_ || committed_) return;
+  // Only commands write the durable state and the action ledger, and no other
+  // command can have run since begin_locked(), so putting both back loses
+  // nothing. Session authority is derived from the durable state and follows it.
+  internal::StateLockGuard guard(coordinator_->state_mutex_, coordinator_->state_lock_owner_);
+  coordinator_->durable_ = std::move(durable_);
+  coordinator_->pending_actions_ = std::move(pending_actions_);
+  coordinator_->refresh_all_worker_authority_locked();
+}
+
 namespace internal {
 const ProtocolId& wire_protocol_id() {
   static const ProtocolId id = ProtocolId::from_valid("ref-wire");

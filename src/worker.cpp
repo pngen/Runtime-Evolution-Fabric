@@ -187,6 +187,18 @@ Status RuntimeWorker::send_heartbeat() {
   if (!status_text.has_value() || *status_text != "OK") {
     return Status::failure(ErrorCode::StaleBoot, "heartbeat was refused by the coordinator");
   }
+  // The acknowledgement carries the operation class the coordinator grants
+  // now. It replaces the one from the handshake, which goes stale as soon as
+  // the rollout moves to another stage.
+  const auto operation_text = body.text(fid("operation_class"));
+  if (operation_text.has_value()) {
+    const auto operation = parse_operation_class(*operation_text);
+    if (operation.has_value()) {
+      PeerIdentity peer = client_.peer();
+      peer.operation = *operation;
+      client_.set_peer(peer);
+    }
+  }
   return Status::ok();
 }
 

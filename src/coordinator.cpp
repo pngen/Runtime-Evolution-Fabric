@@ -395,8 +395,10 @@ CommandResult EvolutionCoordinator::command_hello(const ProtocolHandshake& hands
   Status persist_status = Status::ok();
   bool do_persist = false;
 
+  CommandScope scope(*this);
   {
     internal::StateLockGuard guard(state_mutex_, state_lock_owner_);
+    scope.begin_locked();
     const Status valid = handshake.validate();
     if (valid.is_failure()) {
       ++stats_.handshakes_rejected;
@@ -432,6 +434,15 @@ CommandResult EvolutionCoordinator::command_hello(const ProtocolHandshake& hands
         result.explanation.push_back("fenced boot identity rejected");
         return result;
       }
+    } else if (durable_.workers.size() >= limits::kWorkers) {
+      // The worker table is bounded and its records are never dropped. One
+      // record too many makes the whole durable image invalid, after which
+      // nothing at all can be written: the new identity is refused instead.
+      ++stats_.handshakes_rejected;
+      result.status = Status::failure(ErrorCode::LimitExceeded,
+                                      "worker table bound reached; a new worker identity cannot be recorded");
+      result.explanation.push_back("worker table is full");
+      return result;
     }
 
     // Protocol negotiation: never below the declared safety floor.
@@ -577,15 +588,26 @@ CommandResult EvolutionCoordinator::command_hello(const ProtocolHandshake& hands
     if (do_persist) persist_status = encode_locked(encoded);
   }
 
-  result.status = Status::ok();
-  if (persist_status.is_failure()) return result;
-  if (do_persist) {
+  result.status = persist_status;
+  if (persist_status.is_ok() && do_persist) {
     const Status stored = persist(encoded);
     if (stored.is_failure()) {
       result.status = stored;
-      result.explanation.push_back("handshake accepted but durable state could not be persisted");
+      result.explanation.push_back("handshake could not be recorded durably and is refused");
     }
   }
+  if (result.status.is_failure()) {
+    // The handshake is refused, so the worker it announced is not live. The
+    // entry is removed only while it still belongs to this session.
+    internal::StateLockGuard guard(state_mutex_, state_lock_owner_);
+    const auto mapping = worker_sessions_.find(handshake.worker);
+    if (mapping != worker_sessions_.end() && mapping->second == peer.session) {
+      worker_sessions_.erase(mapping);
+      live_workers_.erase(handshake.worker);
+    }
+    return result;
+  }
+  scope.commit();
   return result;
 }
 

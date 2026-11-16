@@ -26,8 +26,10 @@ CommandResult EvolutionCoordinator::command_register_component(const PeerIdentit
                                                               const RuntimeComponentVersion& version) {
   std::string encoded;
   CommandResult result;
+  CommandScope scope(*this);
   {
     internal::StateLockGuard guard(state_mutex_, state_lock_owner_);
+    scope.begin_locked();
     const Status valid = version.validate();
     if (valid.is_failure()) return failure_json(valid);
     if (!peer.is_operator) {
@@ -68,6 +70,7 @@ CommandResult EvolutionCoordinator::command_register_component(const PeerIdentit
   }
   const Status stored = persist(encoded);
   if (stored.is_failure()) return failure_json(stored);
+  scope.commit();
   return ok_result("runtime component version registered");
 }
 
@@ -77,8 +80,10 @@ CommandResult EvolutionCoordinator::command_publish_capability(const PeerIdentit
                                                                CapabilityGeneration capability,
                                                                const std::vector<FeatureSupport>& features) {
   std::string encoded;
+  CommandScope scope(*this);
   {
     internal::StateLockGuard guard(state_mutex_, state_lock_owner_);
+    scope.begin_locked();
     if (!peer.is_operator && !(peer.component == component && peer.runtime_generation == generation)) {
       return failure_json(Status::failure(ErrorCode::Unauthorized,
                                             "capability publication is limited to the publisher's own generation"));
@@ -106,14 +111,17 @@ CommandResult EvolutionCoordinator::command_publish_capability(const PeerIdentit
   }
   const Status stored = persist(encoded);
   if (stored.is_failure()) return failure_json(stored);
+  scope.commit();
   return ok_result("capability generation published");
 }
 
 CommandResult EvolutionCoordinator::command_publish_compatibility(const PeerIdentity& peer,
                                                                  const CompatibilityEdge& edge) {
   std::string encoded;
+  CommandScope scope(*this);
   {
     internal::StateLockGuard guard(state_mutex_, state_lock_owner_);
+    scope.begin_locked();
     const Status authorized = validate_operator(peer);
     if (authorized.is_failure()) return failure_json(authorized);
     CompatibilityEdge stamped = edge;
@@ -151,14 +159,17 @@ CommandResult EvolutionCoordinator::command_publish_compatibility(const PeerIden
   }
   const Status stored = persist(encoded);
   if (stored.is_failure()) return failure_json(stored);
+  scope.commit();
   return ok_result("compatibility edge published; bound plans must be rebound");
 }
 
 CommandResult EvolutionCoordinator::command_publish_schema(const PeerIdentity& peer,
                                                           const SchemaDescriptor& descriptor) {
   std::string encoded;
+  CommandScope scope(*this);
   {
     internal::StateLockGuard guard(state_mutex_, state_lock_owner_);
+    scope.begin_locked();
     const Status authorized = validate_operator(peer);
     if (authorized.is_failure()) return failure_json(authorized);
     const Status published = durable_.schemas.publish(descriptor);
@@ -168,14 +179,17 @@ CommandResult EvolutionCoordinator::command_publish_schema(const PeerIdentity& p
   }
   const Status stored = persist(encoded);
   if (stored.is_failure()) return failure_json(stored);
+  scope.commit();
   return ok_result("schema generation published");
 }
 
 CommandResult EvolutionCoordinator::command_publish_protocol(const PeerIdentity& peer,
                                                             const ProtocolDescriptor& descriptor) {
   std::string encoded;
+  CommandScope scope(*this);
   {
     internal::StateLockGuard guard(state_mutex_, state_lock_owner_);
+    scope.begin_locked();
     const Status authorized = validate_operator(peer);
     if (authorized.is_failure()) return failure_json(authorized);
     const Status published = durable_.protocols.publish(descriptor);
@@ -185,6 +199,7 @@ CommandResult EvolutionCoordinator::command_publish_protocol(const PeerIdentity&
   }
   const Status stored = persist(encoded);
   if (stored.is_failure()) return failure_json(stored);
+  scope.commit();
   return ok_result("protocol generation published");
 }
 
@@ -194,8 +209,10 @@ CommandResult EvolutionCoordinator::command_publish_protocol(const PeerIdentity&
 CommandResult EvolutionCoordinator::command_create_plan(const PeerIdentity& peer, const PlanSpec& spec) {
   std::string encoded;
   CommandResult result;
+  CommandScope scope(*this);
   {
     internal::StateLockGuard guard(state_mutex_, state_lock_owner_);
+    scope.begin_locked();
     const Status authorized = validate_operator(peer);
     if (authorized.is_failure()) return failure_json(authorized);
     if (spec.component.empty() || !spec.candidate_generation.is_set()) {
@@ -287,6 +304,12 @@ CommandResult EvolutionCoordinator::command_create_plan(const PeerIdentity& peer
     EvolutionPlan plan;
     plan.id = spec.id.empty() ? EvolutionPlanId::from_valid("plan-" + std::to_string(durable_.plans.size() + 1))
                               : spec.id;
+    if (durable_.plans.find(plan.id) != durable_.plans.end()) {
+      // Plans are history and are never replaced. Inserting under an identity
+      // that exists would change nothing and still report a new plan.
+      return failure_json(Status::failure(ErrorCode::AlreadyExists,
+                                            "an evolution plan with this identity already exists"));
+    }
     plan.generation = EvolutionPlanGeneration::first();
     plan.component = spec.component;
     plan.current_generation = *authoritative;
@@ -366,6 +389,7 @@ CommandResult EvolutionCoordinator::command_create_plan(const PeerIdentity& peer
   }
   const Status stored = persist(encoded);
   if (stored.is_failure()) return failure_json(stored);
+  scope.commit();
   return result;
 }
 
@@ -433,8 +457,10 @@ CommandResult EvolutionCoordinator::command_advance_stage(const PeerIdentity& pe
   std::string encoded;
   CommandResult result;
   bool changed = false;
+  CommandScope scope(*this);
   {
     internal::StateLockGuard guard(state_mutex_, state_lock_owner_);
+    scope.begin_locked();
     const Status authorized = validate_operator(peer);
     if (authorized.is_failure()) return failure_json(authorized);
     EvolutionPlan* plan = mutable_plan_locked(plan_id);
@@ -564,7 +590,8 @@ CommandResult EvolutionCoordinator::command_advance_stage(const PeerIdentity& pe
         break;
     }
     if (transition.is_failure()) {
-      // Nothing was persisted: the stage change is rolled back in memory.
+      // Nothing was persisted, and the command scope puts the plan, the stage
+      // history and the lifecycles back as they were.
       return failure_json(transition);
     }
     refresh_worker_authority_locked(plan->component);
@@ -590,6 +617,7 @@ CommandResult EvolutionCoordinator::command_advance_stage(const PeerIdentity& pe
     const Status stored = persist(encoded);
     if (stored.is_failure()) return failure_json(stored);
   }
+  scope.commit();
   return result;
 }
 
@@ -597,8 +625,10 @@ CommandResult EvolutionCoordinator::command_rebind_plan(const PeerIdentity& peer
                                                         EvolutionPlanGeneration expected_generation) {
   std::string encoded;
   CommandResult result;
+  CommandScope scope(*this);
   {
     internal::StateLockGuard guard(state_mutex_, state_lock_owner_);
+    scope.begin_locked();
     const Status authorized = validate_operator(peer);
     if (authorized.is_failure()) return failure_json(authorized);
     EvolutionPlan* plan = mutable_plan_locked(plan_id);
@@ -629,6 +659,7 @@ CommandResult EvolutionCoordinator::command_rebind_plan(const PeerIdentity& peer
   }
   const Status stored = persist(encoded);
   if (stored.is_failure()) return failure_json(stored);
+  scope.commit();
   return result;
 }
 
@@ -637,8 +668,10 @@ CommandResult EvolutionCoordinator::command_enable_feature(const PeerIdentity& p
                                                            const EvolutionPlanId& plan_id) {
   std::string encoded;
   CommandResult result;
+  CommandScope scope(*this);
   {
     internal::StateLockGuard guard(state_mutex_, state_lock_owner_);
+    scope.begin_locked();
     const Status authorized = validate_operator(peer);
     if (authorized.is_failure()) return failure_json(authorized);
     EvolutionPlan* plan = mutable_plan_locked(plan_id);
@@ -707,6 +740,7 @@ CommandResult EvolutionCoordinator::command_enable_feature(const PeerIdentity& p
   }
   const Status stored = persist(encoded);
   if (stored.is_failure()) return failure_json(stored);
+  scope.commit();
   return result;
 }
 

@@ -77,8 +77,10 @@ CommandResult EvolutionCoordinator::command_request_drain(const PeerIdentity& pe
                                                           RuntimeGeneration generation) {
   std::string encoded;
   CommandResult result;
+  CommandScope scope(*this);
   {
     internal::StateLockGuard guard(state_mutex_, state_lock_owner_);
+    scope.begin_locked();
     if (!peer.is_operator && !(peer.component == component && peer.runtime_generation == generation)) {
       return failure_json(Status::failure(ErrorCode::Unauthorized,
                                           "drain requests require operator authority or the drained generation"));
@@ -93,13 +95,6 @@ CommandResult EvolutionCoordinator::command_request_drain(const PeerIdentity& pe
     if (is_terminal_lifecycle(version->lifecycle)) {
       return failure_json(Status::failure(ErrorCode::RetiredGeneration, "runtime generation is retired"));
     }
-    std::uint64_t marked = 0;
-    for (auto& [id, worker] : live_workers_) {
-      (void)id;
-      if (worker.component != component || worker.generation != generation) continue;
-      worker.draining = true;
-      ++marked;
-    }
     Status transition = Status::ok();
     if (version->lifecycle != LifecycleState::Draining) {
       transition = advance_lifecycle_locked(component, generation, LifecycleState::Draining);
@@ -109,6 +104,15 @@ CommandResult EvolutionCoordinator::command_request_drain(const PeerIdentity& pe
           version->lifecycle != LifecycleState::Eligible) {
         return failure_json(transition);
       }
+    }
+    // Workers are marked only once the drain is accepted: a refused drain must
+    // not leave them looking drained to the stage preconditions.
+    std::uint64_t marked = 0;
+    for (auto& [id, worker] : live_workers_) {
+      (void)id;
+      if (worker.component != component || worker.generation != generation) continue;
+      worker.draining = true;
+      ++marked;
     }
     const Status dispatched = dispatch_drain_locked(component, generation);
     if (dispatched.is_failure() && dispatched.code() != ErrorCode::NotFound) {
@@ -131,6 +135,7 @@ CommandResult EvolutionCoordinator::command_request_drain(const PeerIdentity& pe
   }
   const Status stored = persist(encoded);
   if (stored.is_failure()) return failure_json(stored);
+  scope.commit();
   return result;
 }
 
@@ -203,6 +208,9 @@ CommandResult EvolutionCoordinator::command_request_migration(const PeerIdentity
                                                               const EvolutionPlanId& plan_id) {
   std::string encoded;
   CommandResult result;
+  // Serialized with the other commands, but never undone: the attempt this
+  // registers is an external side effect in flight and stays on the ledger.
+  CommandScope scope(*this);
   {
     internal::StateLockGuard guard(state_mutex_, state_lock_owner_);
     const Status authorized = validate_operator(peer);
@@ -298,8 +306,10 @@ CommandResult EvolutionCoordinator::command_request_rollback(const PeerIdentity&
                                                             const EvolutionPlanId& plan_id) {
   std::string encoded;
   CommandResult result;
+  CommandScope scope(*this);
   {
     internal::StateLockGuard guard(state_mutex_, state_lock_owner_);
+    scope.begin_locked();
     const Status authorized = validate_operator(peer);
     if (authorized.is_failure()) return failure_json(authorized);
     EvolutionPlan* plan = mutable_plan_locked(plan_id);
@@ -309,11 +319,14 @@ CommandResult EvolutionCoordinator::command_request_rollback(const PeerIdentity&
     }
     const RuntimeComponentVersion* target =
         durable_.components.find(plan->component, plan->rollback_target);
-    bool target_available = target != nullptr && !is_terminal_lifecycle(target->lifecycle);
-    if (target_available) {
+    // Authority can only return to a generation that has a process to take
+    // it: a registered version alone resumes nothing.
+    bool target_available = false;
+    if (target != nullptr && !is_terminal_lifecycle(target->lifecycle)) {
       for (const auto& [id, worker] : live_workers_) {
         (void)id;
-        if (worker.component == plan->component && worker.generation == plan->rollback_target && worker.active) {
+        if (worker.component == plan->component && worker.generation == plan->rollback_target &&
+            worker.active && !worker.fenced) {
           target_available = true;
           break;
         }
@@ -388,6 +401,8 @@ CommandResult EvolutionCoordinator::command_request_rollback(const PeerIdentity&
       result.json = writer.str();
       const Status stored = persist(encoded);
       if (stored.is_failure()) return failure_json(stored);
+      // The refused attempt is part of the rollback history and stays.
+      scope.commit();
       return result;
     }
 
@@ -470,6 +485,7 @@ CommandResult EvolutionCoordinator::command_request_rollback(const PeerIdentity&
   }
   const Status stored = persist(encoded);
   if (stored.is_failure()) return failure_json(stored);
+  scope.commit();
   return result;
 }
 
@@ -499,8 +515,10 @@ CommandResult EvolutionCoordinator::command_request_retirement(const PeerIdentit
                                                                RuntimeGeneration generation) {
   std::string encoded;
   CommandResult result;
+  CommandScope scope(*this);
   {
     internal::StateLockGuard guard(state_mutex_, state_lock_owner_);
+    scope.begin_locked();
     const Status authorized = validate_operator(peer);
     if (authorized.is_failure()) return failure_json(authorized);
     const RuntimeComponentVersion* version = durable_.components.find(component, generation);
@@ -633,6 +651,7 @@ CommandResult EvolutionCoordinator::command_request_retirement(const PeerIdentit
   }
   const Status stored = persist(encoded);
   if (stored.is_failure()) return failure_json(stored);
+  scope.commit();
   return result;
 }
 
@@ -640,8 +659,10 @@ CommandResult EvolutionCoordinator::command_supersede_plan(const PeerIdentity& p
                                                            const EvolutionPlanId& plan_id) {
   std::string encoded;
   CommandResult result;
+  CommandScope scope(*this);
   {
     internal::StateLockGuard guard(state_mutex_, state_lock_owner_);
+    scope.begin_locked();
     const Status authorized = validate_operator(peer);
     if (authorized.is_failure()) return failure_json(authorized);
     EvolutionPlan* plan = mutable_plan_locked(plan_id);
@@ -680,6 +701,7 @@ CommandResult EvolutionCoordinator::command_supersede_plan(const PeerIdentity& p
   }
   const Status stored = persist(encoded);
   if (stored.is_failure()) return failure_json(stored);
+  scope.commit();
   return result;
 }
 
@@ -692,8 +714,10 @@ CommandResult EvolutionCoordinator::command_request_lifecycle(const PeerIdentity
                                                               LifecycleState next) {
   std::string encoded;
   CommandResult result;
+  CommandScope scope(*this);
   {
     internal::StateLockGuard guard(state_mutex_, state_lock_owner_);
+    scope.begin_locked();
     const Status authorized = validate_operator(peer);
     if (authorized.is_failure()) return failure_json(authorized);
     if (component.empty() || !generation.is_set()) {
@@ -733,6 +757,7 @@ CommandResult EvolutionCoordinator::command_request_lifecycle(const PeerIdentity
   }
   const Status stored = persist(encoded);
   if (stored.is_failure()) return failure_json(stored);
+  scope.commit();
   return result;
 }
 
@@ -743,8 +768,10 @@ CommandResult EvolutionCoordinator::command_fence(const PeerIdentity& peer, cons
                                                   WorkerBootId boot, std::string_view reason) {
   std::string encoded;
   CommandResult result;
+  CommandScope scope(*this);
   {
     internal::StateLockGuard guard(state_mutex_, state_lock_owner_);
+    scope.begin_locked();
     const Status authorized = validate_operator(peer);
     if (authorized.is_failure()) return failure_json(authorized);
     if (worker.empty() || !boot.is_set()) {
@@ -758,19 +785,25 @@ CommandResult EvolutionCoordinator::command_fence(const PeerIdentity& peer, cons
     record.boot = boot;
     record.reason = NoteText::from_valid(reason);
     record.fenced_at = durable_.stage_generation;
+    // The fence names one incarnation. A newer incarnation of the same worker
+    // that has registered since is a different boot and is left alone.
     const auto live = live_workers_.find(worker);
     if (live != live_workers_.end()) {
       record.component = live->second.component;
       record.generation = live->second.generation;
-      live->second.fenced = true;
-      live->second.active = false;
+      if (live->second.boot == boot) {
+        live->second.fenced = true;
+        live->second.active = false;
+      }
     }
     const auto stored_worker = durable_.workers.find(worker);
     if (stored_worker != durable_.workers.end()) {
       if (record.component.empty()) record.component = stored_worker->second.component;
       if (!record.generation.is_set()) record.generation = stored_worker->second.generation;
-      stored_worker->second.fenced = true;
-      stored_worker->second.detail = DetailText::from_valid("fenced by operator");
+      if (stored_worker->second.last_boot == boot) {
+        stored_worker->second.fenced = true;
+        stored_worker->second.detail = DetailText::from_valid("fenced by operator");
+      }
     }
     durable_.fenced_boots[std::make_pair(worker, boot.raw())] = record;
     ++stats_.fenced_boots;
@@ -787,6 +820,7 @@ CommandResult EvolutionCoordinator::command_fence(const PeerIdentity& peer, cons
   }
   const Status stored = persist(encoded);
   if (stored.is_failure()) return failure_json(stored);
+  scope.commit();
   return result;
 }
 
@@ -801,8 +835,10 @@ CommandResult EvolutionCoordinator::command_publish_completion(const PeerIdentit
                                                                IntegrityDigest state_digest, bool drain) {
   std::string encoded;
   CommandResult result;
+  CommandScope scope(*this);
   {
     internal::StateLockGuard guard(state_mutex_, state_lock_owner_);
+    scope.begin_locked();
     if (stage_id.empty()) {
       return failure_json(Status::failure(ErrorCode::InvalidArgument, "completion has no stage identity"));
     }
@@ -849,6 +885,7 @@ CommandResult EvolutionCoordinator::command_publish_completion(const PeerIdentit
       if (encoded_status.is_failure()) return failure_json(encoded_status);
       const Status stored = persist(encoded);
       if (stored.is_failure()) return failure_json(stored);
+      scope.commit();
       JsonWriter writer;
       writer.begin_object();
       writer.field("status", "OK");
@@ -858,7 +895,11 @@ CommandResult EvolutionCoordinator::command_publish_completion(const PeerIdentit
       return ok_json(writer.str(), "drain completion recorded");
     }
 
-    if (plan_id.empty() || !stage_generation.is_set()) {
+    // A migration request carries no stage identity, so the completion that
+    // answers it cannot echo one. It is bound to the outstanding action it
+    // answers, and through that action to the stage it was dispatched under.
+    const bool action_bound = stage_id.view() == "migration";
+    if (plan_id.empty() || (!action_bound && !stage_generation.is_set())) {
       return failure_json(Status::failure(ErrorCode::InvalidArgument, "completion is incomplete"));
     }
     EvolutionPlan* plan = mutable_plan_locked(plan_id);
@@ -871,16 +912,6 @@ CommandResult EvolutionCoordinator::command_publish_completion(const PeerIdentit
       return failure_json(
           Status::failure(ErrorCode::StalePlan, "plan is superseded; late completion is rejected"));
     }
-    if (stage_generation != plan->stage_generation) {
-      ++stats_.completions_rejected;
-      return failure_json(
-          Status::failure(ErrorCode::StalePlan, "completion targets a superseded stage generation"));
-    }
-    if (!plan->history.empty() && plan->history.back().stage_id != stage_id) {
-      ++stats_.completions_rejected;
-      return failure_json(
-          Status::failure(ErrorCode::StalePlan, "completion does not reference the current stage identity"));
-    }
     PendingAction* action = nullptr;
     for (auto& candidate : pending_actions_) {
       if (candidate.plan != plan_id) continue;
@@ -889,10 +920,35 @@ CommandResult EvolutionCoordinator::command_publish_completion(const PeerIdentit
       action = &candidate;
       break;
     }
+    if (action_bound) {
+      if (action != nullptr && action->stage != plan->stage_generation) {
+        ++stats_.completions_rejected;
+        return failure_json(
+            Status::failure(ErrorCode::StalePlan, "completion targets a superseded stage generation"));
+      }
+    } else {
+      if (stage_generation != plan->stage_generation) {
+        ++stats_.completions_rejected;
+        return failure_json(
+            Status::failure(ErrorCode::StalePlan, "completion targets a superseded stage generation"));
+      }
+      if (!plan->history.empty() && plan->history.back().stage_id != stage_id) {
+        ++stats_.completions_rejected;
+        return failure_json(Status::failure(ErrorCode::StalePlan,
+                                            "completion does not reference the current stage identity"));
+      }
+    }
     if (action == nullptr) {
       ++stats_.completions_rejected;
       return failure_json(
           Status::failure(ErrorCode::Conflict, "no outstanding action for this completion; duplicate rejected"));
+    }
+    if (action->boot != peer.boot) {
+      // Only the incarnation the action was dispatched to can have carried it
+      // out. A later incarnation reports what it observes through reconciliation.
+      ++stats_.completions_rejected;
+      return failure_json(Status::failure(
+          ErrorCode::StaleBoot, "completion comes from another incarnation than the action was dispatched to"));
     }
     const bool completed = migration_outcome == MigrationOutcome::Committed ||
                            migration_outcome == MigrationOutcome::RollbackAvailable ||
@@ -942,6 +998,7 @@ CommandResult EvolutionCoordinator::command_publish_completion(const PeerIdentit
   }
   const Status stored = persist(encoded);
   if (stored.is_failure()) return failure_json(stored);
+  scope.commit();
   return result;
 }
 

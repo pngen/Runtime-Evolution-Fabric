@@ -72,6 +72,9 @@ real TCP sockets.
 
 Global lock order, with a debug-build reentrancy detector that aborts on violation:
 
+0. `command_mutex_` — one mutating command at a time, from its first look at the state until its
+   image has been written, so images reach the file in the order the changes were made; held
+   across that write, never across socket I/O.
 1. `state_mutex_` — durable plus dynamic evolution state; never held across socket I/O, file I/O,
    callbacks, joins or process waits.
 2. `pending_mutex_` — outbound action ledger.
@@ -317,7 +320,7 @@ First-party code builds with `/W4 /WX /permissive- /utf-8` on MSVC and with
     ./build/tests/ref_tests --filter race   # one suite
     ./build/tests/ref_tests --list
 
-The suite has 64 tests and roughly 1,400 checks: identity, codec, compatibility, protocol and schema
+The suite has 73 tests and roughly 1,500 checks: identity, codec, compatibility, protocol and schema
 units; real-filesystem migration and irreversible-barrier proofs; persistence and protocol
 adversarial suites; coordinator behaviour over real sockets; seeded randomized property tests;
 deterministic interleaving tests; and five real multiprocess proofs (dual-generation coexistence,

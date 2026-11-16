@@ -1,6 +1,10 @@
 // Runtime Evolution Fabric - coordinator behaviour: rollout stages, authority,
 // feature gates, drain, rollback, retirement, fencing and recovery.
+#include <atomic>
+#include <chrono>
 #include <memory>
+#include <string>
+#include <thread>
 
 #include "support/fabric_harness.hpp"
 #include "support/fixtures.hpp"
@@ -458,4 +462,365 @@ REF_TEST(coordinator, concurrent_clients_get_consistent_authority) {
   stop = true;
   for (auto& thread : readers) thread.join();
   REF_CHECK_EQ(inconsistencies.load(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Authority, atomicity and durability of the command surface
+// ---------------------------------------------------------------------------
+namespace {
+
+ProtocolHandshake handshake_for(const std::string& worker, std::uint64_t boot) {
+  ProtocolHandshake handshake;
+  handshake.component = RuntimeComponentId::from_valid("orders");
+  handshake.version.number = VersionNumber{1, 0, 0};
+  handshake.version.artifact.build = BuildId::from_valid("refworker-gen1");
+  handshake.runtime_generation = RuntimeGeneration::from_raw(1);
+  handshake.worker = WorkerId::from_valid(worker);
+  handshake.boot = WorkerBootId::from_raw(boot);
+  handshake.protocol = ProtocolId::from_valid("ref-wire");
+  (void)decode_generation_set("1", handshake.supported_protocols);
+  handshake.required_minimum = handshake.supported_protocols.lowest();
+  (void)decode_generation_set("1", handshake.supported_schemas);
+  handshake.committed_schema = handshake.supported_schemas.lowest();
+  handshake.capability_generation = CapabilityGeneration::from_raw(1);
+  handshake.declared_role = NoteText::from_valid("test worker");
+  return handshake;
+}
+
+// Asks the coordinator for its authority view on a worker session and returns
+// the status text of the answer.
+std::string query_status(TestWorker& worker) {
+  WireMessage query;
+  (void)query.set_text(FieldId::from_valid("query"), "authority");
+  (void)query.set_ident(FieldId::from_valid("component"), RuntimeComponentId::from_valid("orders"));
+  Frame response;
+  WireMessage body;
+  const Status sent = worker.client().request(MessageType::QueryState, query, response, body);
+  if (sent.is_failure()) return "TRANSPORT_FAILURE";
+  const auto status = body.text(FieldId::from_valid("status"));
+  return status.has_value() ? std::string(*status) : std::string("NO_STATUS");
+}
+
+const EvolutionPlanId& plan_one() {
+  static const EvolutionPlanId id = EvolutionPlanId::from_valid("plan-1");
+  return id;
+}
+
+}  // namespace
+
+REF_TEST(coordinator, worker_table_bound_is_enforced_at_the_handshake) {
+  TempDir dir("coordinator-worker-bound");
+  const std::string path = dir.file("evolution.state");
+  {
+    // A durable image whose worker table is exactly full.
+    DurableState state;
+    {
+      Fabric seed(path);
+      bootstrap_fleet(seed);
+      state = seed->durable_state_copy();
+    }
+    for (std::size_t i = 0; i < limits::kWorkers; ++i) {
+      WorkerRecord record;
+      record.worker = WorkerId::from_valid("fleet-" + std::to_string(i));
+      record.component = RuntimeComponentId::from_valid("orders");
+      record.generation = RuntimeGeneration::from_raw(1);
+      record.last_boot = WorkerBootId::from_raw(1);
+      state.workers[record.worker] = record;
+    }
+    std::string bytes;
+    REF_CHECK_STATUS_OK(DurableStore::encode(state, bytes));
+    REF_CHECK_STATUS_OK(write_file_atomic(path, bytes));
+  }
+  Fabric fabric(path);
+  REF_CHECK_EQ(fabric->durable_state_copy().workers.size(), limits::kWorkers);
+
+  // One more worker identity does not fit, and is told so.
+  PeerIdentity stranger;
+  stranger.session = SessionId::from_valid("bound-stranger");
+  REF_CHECK_STATUS_CODE(fabric->command_hello(handshake_for("one-too-many", 1), stranger).status,
+                        ErrorCode::LimitExceeded);
+  REF_CHECK_EQ(fabric->durable_state_copy().workers.size(), limits::kWorkers);
+
+  // A worker the table already knows is still admitted, and the coordinator
+  // can still record durable changes.
+  PeerIdentity known;
+  known.session = SessionId::from_valid("bound-known");
+  REF_CHECK_STATUS_OK(fabric->command_hello(handshake_for("fleet-7", 2), known).status);
+  REF_CHECK_STATUS_OK(fabric.create_plan("orders", 2, "canary-a", nullptr, false).status);
+}
+
+REF_TEST(coordinator, fencing_an_old_boot_does_not_fence_its_replacement) {
+  TempDir dir("coordinator-fence-old");
+  Fabric fabric(dir.file("evolution.state"));
+  bootstrap_fleet(fabric);
+  TestWorker first(fabric, "worker-a", 1, 1, "1", "1");
+  REF_CHECK_STATUS_OK(first.connect());
+  TestWorker replacement(fabric, "worker-a", 2, 1, "1", "1");
+  REF_CHECK_STATUS_OK(replacement.connect());
+
+  REF_CHECK_STATUS_OK(fabric->command_fence(fabric.op(), WorkerId::from_valid("worker-a"),
+                                            WorkerBootId::from_raw(1), "previous incarnation")
+                          .status);
+
+  bool replacement_is_live = false;
+  for (const LiveWorker& worker : fabric->live_workers()) {
+    if (worker.worker == WorkerId::from_valid("worker-a")) {
+      replacement_is_live = worker.boot.raw() == 2ull && !worker.fenced && worker.active;
+    }
+  }
+  REF_CHECK(replacement_is_live);
+  const DurableState state = fabric->durable_state_copy();
+  const auto record = state.workers.find(WorkerId::from_valid("worker-a"));
+  REF_CHECK(record != state.workers.end() && !record->second.fenced);
+  REF_CHECK(state.is_boot_fenced(WorkerId::from_valid("worker-a"), WorkerBootId::from_raw(1)));
+  REF_CHECK(!state.is_boot_fenced(WorkerId::from_valid("worker-a"), WorkerBootId::from_raw(2)));
+
+  // The replacement is still heard and its incarnation may connect again.
+  REF_CHECK_EQ(query_status(replacement), std::string("OK"));
+  TestWorker again(fabric, "worker-a", 2, 1, "1", "1");
+  REF_CHECK_STATUS_OK(again.connect());
+}
+
+REF_TEST(coordinator, a_replaced_incarnation_loses_its_session) {
+  TempDir dir("coordinator-replaced");
+  Fabric fabric(dir.file("evolution.state"));
+  bootstrap_fleet(fabric);
+  TestWorker first(fabric, "worker-a", 1, 1, "1", "1");
+  REF_CHECK_STATUS_OK(first.connect());
+  REF_CHECK_EQ(query_status(first), std::string("OK"));
+
+  TestWorker replacement(fabric, "worker-a", 2, 1, "1", "1");
+  REF_CHECK_STATUS_OK(replacement.connect());
+
+  // The session of the incarnation that was replaced holds no authority now.
+  REF_CHECK_EQ(query_status(first), std::string(to_string(ErrorCode::StaleBoot)));
+  REF_CHECK_EQ(query_status(replacement), std::string("OK"));
+}
+
+REF_TEST(coordinator, rollback_requires_a_live_process_of_the_target_generation) {
+  TempDir dir("coordinator-rollback-target");
+  Fabric fabric(dir.file("evolution.state"));
+  bootstrap_fleet(fabric);
+  REF_CHECK_STATUS_OK(fabric.create_plan("orders", 2, "canary-a", nullptr, false).status);
+  REF_CHECK_STATUS_OK(fabric.advance(RolloutStage::CompatibilityProven).status);
+  REF_CHECK_STATUS_OK(fabric.advance(RolloutStage::CanaryCohort).status);
+
+  // No process of generation 1 is alive, so nothing could resume authority.
+  REF_CHECK_STATUS_CODE(fabric->command_request_rollback(fabric.op(), plan_one()).status,
+                        ErrorCode::NotFound);
+  REF_CHECK_EQ(fabric.plan().stage, RolloutStage::CanaryCohort);
+  const DurableState refused = fabric->durable_state_copy();
+  const RuntimeComponentVersion* candidate =
+      refused.components.find(RuntimeComponentId::from_valid("orders"), RuntimeGeneration::from_raw(2));
+  REF_CHECK(candidate != nullptr && candidate->lifecycle == LifecycleState::CanaryActive);
+
+  TestWorker old_worker(fabric, "worker-a", 1, 1, "1", "1");
+  REF_CHECK_STATUS_OK(old_worker.connect());
+  REF_CHECK_STATUS_OK(fabric->command_request_rollback(fabric.op(), plan_one()).status);
+  REF_CHECK_EQ(fabric.plan().stage, RolloutStage::RolledBack);
+}
+
+REF_TEST(coordinator, a_plan_identity_cannot_be_reused) {
+  TempDir dir("coordinator-plan-identity");
+  Fabric fabric(dir.file("evolution.state"));
+  bootstrap_fleet(fabric);
+  REF_CHECK_STATUS_OK(fabric.create_plan("orders", 2, "canary-a", nullptr, false).status);
+  REF_CHECK_STATUS_OK(fabric->command_supersede_plan(fabric.op(), plan_one()).status);
+
+  // A third generation becomes eligible; a plan for it reuses the old identity.
+  REF_CHECK_STATUS_OK(fabric.register_component(reftest::make_component(
+                          "orders", 3, "1,2", "1,2", LifecycleState::Registered, {}, {}, "refworker-gen3"))
+                          .status);
+  REF_CHECK_STATUS_OK(fabric.publish_edge(1, 3).status);
+  REF_CHECK_STATUS_CODE(fabric.create_plan("orders", 3, "canary-a", nullptr, false).status,
+                        ErrorCode::AlreadyExists);
+
+  const DurableState state = fabric->durable_state_copy();
+  const RuntimeComponentVersion* third =
+      state.components.find(RuntimeComponentId::from_valid("orders"), RuntimeGeneration::from_raw(3));
+  REF_CHECK(third != nullptr && third->lifecycle == LifecycleState::Eligible);
+  REF_CHECK(fabric.plan().superseded);
+  REF_CHECK_EQ(fabric.plan().candidate_generation.raw(), 2ull);
+}
+
+REF_TEST(coordinator, a_rejected_plan_request_changes_nothing) {
+  TempDir dir("coordinator-plan-rejected");
+  Fabric fabric(dir.file("evolution.state"));
+  bootstrap_fleet(fabric);
+  REF_CHECK_STATUS_OK(fabric.create_plan("orders", 2, "canary-a", nullptr, false).status);
+  REF_CHECK_STATUS_OK(fabric->command_supersede_plan(fabric.op(), plan_one()).status);
+  const DurableState before = fabric->durable_state_copy();
+
+  // Generation 2 is still UPGRADE_PENDING from the superseded plan, so a second
+  // plan for it is refused at the lifecycle transition.
+  PlanSpec spec;
+  spec.id = EvolutionPlanId::from_valid("plan-2");
+  spec.component = RuntimeComponentId::from_valid("orders");
+  spec.candidate_generation = RuntimeGeneration::from_raw(2);
+  spec.canary_cohort = CohortId::from_valid("canary-a");
+  spec.cohorts.push_back(spec.canary_cohort);
+  REF_CHECK(fabric->command_create_plan(fabric.op(), spec).status.is_failure());
+
+  const DurableState after = fabric->durable_state_copy();
+  REF_CHECK_EQ(after.evolution_epoch.raw(), before.evolution_epoch.raw());
+  REF_CHECK_EQ(after.stage_generation.raw(), before.stage_generation.raw());
+  REF_CHECK_EQ(after.policy_generation.raw(), before.policy_generation.raw());
+  REF_CHECK_EQ(after.stage_history.size(), before.stage_history.size());
+  REF_CHECK_EQ(after.plans.size(), before.plans.size());
+}
+
+REF_TEST(coordinator, a_command_that_could_not_be_persisted_leaves_no_trace) {
+  TempDir dir("coordinator-unpersisted");
+  const std::string path = dir.file("evolution.state");
+  Fabric fabric(path);
+  bootstrap_fleet(fabric);
+  REF_CHECK_STATUS_OK(fabric.create_plan("orders", 2, "canary-a", nullptr, false).status);
+  const StageGeneration stage_before = fabric.plan().stage_generation;
+
+  fabric->set_fail_persistence(true);
+  REF_CHECK(fabric.advance(RolloutStage::CompatibilityProven).status.is_failure());
+  fabric->set_fail_persistence(false);
+
+  // The refused advance is not in effect in the running coordinator.
+  REF_CHECK_EQ(fabric.plan().stage, RolloutStage::CandidateRegistered);
+  REF_CHECK_EQ(fabric.plan().stage_generation.raw(), stage_before.raw());
+
+  // A later command that does persist must not carry the refused advance into
+  // the durable image with it.
+  REF_CHECK_STATUS_OK(
+      fabric->command_rebind_plan(fabric.op(), plan_one(), EvolutionPlanGeneration::unset()).status);
+  DurableState on_disk;
+  REF_CHECK_STATUS_OK(DurableStore(path).load(on_disk));
+  const auto stored = on_disk.plans.find(plan_one());
+  REF_CHECK(stored != on_disk.plans.end() && stored->second.stage == RolloutStage::CandidateRegistered);
+
+  // The advance can be asked for again and then succeeds.
+  REF_CHECK_STATUS_OK(fabric.advance(RolloutStage::CompatibilityProven, stage_before).status);
+  REF_CHECK_EQ(fabric.plan().stage, RolloutStage::CompatibilityProven);
+}
+
+REF_TEST(coordinator, concurrent_commands_reach_the_durable_image_in_order) {
+  TempDir dir("coordinator-persist-order");
+  const std::string path = dir.file("evolution.state");
+  Fabric fabric(path);
+  bootstrap_fleet(fabric);
+  REF_CHECK_STATUS_OK(fabric.create_plan("orders", 2, "canary-a", nullptr, false).status);
+
+  std::atomic<int> refused{0};
+  int stale_images = 0;
+  std::uint64_t capability = 100;
+  for (int round = 0; round < 12; ++round) {
+    std::thread rebinder([&fabric, &refused] {
+      for (int i = 0; i < 6; ++i) {
+        if (fabric->command_rebind_plan(fabric.op(), plan_one(), EvolutionPlanGeneration::unset())
+                .status.is_failure()) {
+          ++refused;
+        }
+      }
+    });
+    std::thread publisher([&fabric, &refused, &capability] {
+      for (int i = 0; i < 6; ++i) {
+        if (fabric
+                ->command_publish_capability(fabric.op(), RuntimeComponentId::from_valid("orders"),
+                                             RuntimeGeneration::from_raw(2),
+                                             CapabilityGeneration::from_raw(++capability), {})
+                .status.is_failure()) {
+          ++refused;
+        }
+      }
+    });
+    rebinder.join();
+    publisher.join();
+
+    // Every command was acknowledged, so the file must hold all of them.
+    const DurableState memory = fabric->durable_state_copy();
+    DurableState on_disk;
+    const Status loaded = DurableStore(path).load(on_disk);
+    const auto in_memory = memory.plans.find(plan_one());
+    const auto stored = on_disk.plans.find(plan_one());
+    const bool current = loaded.is_ok() && in_memory != memory.plans.end() && stored != on_disk.plans.end() &&
+                         stored->second.generation == in_memory->second.generation &&
+                         on_disk.evidence_generation == memory.evidence_generation;
+    if (!current) ++stale_images;
+  }
+  REF_CHECK_EQ(refused.load(), 0);
+  REF_CHECK_EQ(stale_images, 0);
+}
+
+REF_TEST(coordinator, a_worker_that_migrates_is_acknowledged_and_keeps_serving) {
+  TempDir dir("coordinator-worker-migration");
+  Fabric fabric(dir.file("evolution.state"));
+  REF_CHECK_STATUS_OK(fabric.register_component(reftest::make_component(
+                          "orders", 1, "1", "1", LifecycleState::Current, {}, {}, "refworker-gen1"))
+                          .status);
+  // The candidate is registered the way a worker declares it on the wire: by
+  // build label, without a content hash.
+  RuntimeComponentVersion candidate_version = reftest::make_component(
+      "orders", 2, "1,2", "1,2", LifecycleState::Registered, {{1, 2}, {2, 1}, {2, 3}},
+      {reftest::feature("state-token-transform", 1, true, false),
+       reftest::feature("shadow-query", 1, true, true)},
+      "refworker-gen2");
+  candidate_version.version.artifact.content_hash = IntegrityDigest{};
+  REF_CHECK_STATUS_OK(fabric.register_component(candidate_version).status);
+  REF_CHECK_STATUS_OK(fabric.publish_edge(1, 2).status);
+  REF_CHECK_STATUS_OK(fabric.create_plan("orders", 2, "canary-a", "migration-1-2", false).status);
+  REF_CHECK_STATUS_OK(fabric.advance(RolloutStage::CompatibilityProven).status);
+  REF_CHECK_STATUS_OK(fabric.advance(RolloutStage::CanaryCohort).status);
+
+  TestWorker old_worker(fabric, "worker-a", 1, 1, "1", "1");
+  REF_CHECK_STATUS_OK(old_worker.connect());
+
+  WorkerConfig config;
+  config.port = fabric.port();
+  config.component = RuntimeComponentId::from_valid("orders");
+  config.version = candidate_version.version;
+  config.generation = RuntimeGeneration::from_raw(2);
+  config.worker = WorkerId::from_valid("worker-b");
+  config.boot = WorkerBootId::from_raw(1);
+  config.protocol = ProtocolId::from_valid("ref-wire");
+  (void)decode_generation_set("1,2", config.supported_protocols);
+  (void)decode_generation_set("1,2", config.supported_schemas);
+  config.migrations = candidate_version.migrations;
+  config.capability_generation = CapabilityGeneration::from_raw(2);
+  config.state_path = dir.file("worker-b.state");
+  RuntimeWorker worker(config);
+  REF_CHECK_STATUS_OK(worker.initialize_state("worker-b", 0));
+  HandshakeOutcome outcome;
+  const Status registered = worker.connect_and_register(outcome);
+  REF_CHECK_STATUS_OK(registered);
+  if (registered.is_failure()) return;
+
+  REF_CHECK_STATUS_OK(fabric.advance(RolloutStage::MixedVersionCohort).status);
+  REF_CHECK_STATUS_OK(fabric.advance(RolloutStage::MigrationBarrier).status);
+
+  std::atomic<bool> serving_ended{false};
+  Status served = Status::ok();
+  std::thread serving([&worker, &serving_ended, &served] {
+    served = worker.serve();
+    serving_ended = true;
+  });
+  REF_CHECK_STATUS_OK(fabric->command_request_migration(fabric.op(), plan_one()).status);
+
+  // The worker migrates its real state file and reports the completion. Both
+  // waits are bounded: a missing record is a failure, not a reason to hang.
+  bool recorded = false;
+  for (int attempt = 0; attempt < 500 && !recorded && !serving_ended.load(); ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    recorded = !fabric->durable_state_copy().migrations.empty();
+  }
+  if (!recorded) recorded = !fabric->durable_state_copy().migrations.empty();
+  REF_CHECK(recorded);
+  REF_CHECK_EQ(worker.observed_schema().raw(), 2ull);
+  if (recorded) {
+    const DurableState state = fabric->durable_state_copy();
+    REF_CHECK(state.migrations.front().outcome == MigrationOutcome::RollbackAvailable);
+    REF_CHECK(state.migrations.front().plan == plan_one());
+  }
+  // The completion was accepted, so the worker is still serving its session.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  REF_CHECK(!serving_ended.load());
+
+  fabric->stop();
+  serving.join();
+  REF_NOTE("worker session ended with: " + served.to_string());
 }

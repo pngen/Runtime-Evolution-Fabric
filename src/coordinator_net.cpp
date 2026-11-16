@@ -212,6 +212,19 @@ void EvolutionCoordinator::refresh_worker_authority_locked(const RuntimeComponen
   }
 }
 
+void EvolutionCoordinator::refresh_all_worker_authority_locked() {
+  std::lock_guard<std::mutex> guard(connections_mutex_);
+  for (auto& [id, session] : sessions_) {
+    (void)id;
+    if (session == nullptr || !session->handshaked) continue;
+    const OperationClass operation = derive_operation_class_locked(
+        session->peer.component, session->peer.runtime_generation, session->peer.agreed_protocol);
+    session->peer.operation = operation;
+    const auto live = live_workers_.find(session->peer.worker);
+    if (live != live_workers_.end()) live->second.operation = operation;
+  }
+}
+
 void EvolutionCoordinator::mark_session_done(const std::shared_ptr<Session>& session, bool reader) {
   if (reader) {
     session->reader_done = true;
@@ -436,6 +449,12 @@ Status EvolutionCoordinator::validate_frame_semantics_locked(const Session& sess
   const auto live = live_workers_.find(peer.worker);
   if (live == live_workers_.end()) {
     return Status::failure(ErrorCode::StaleBoot, "worker is not current; re-registration is required");
+  }
+  if (live->second.boot != peer.boot) {
+    // A newer incarnation of this worker has registered. The session of the
+    // incarnation it replaced is still open, but it holds no authority.
+    return Status::failure(ErrorCode::StaleBoot,
+                           "a newer incarnation of this worker has registered; this session is not current");
   }
   if (live->second.fenced) {
     return Status::failure(ErrorCode::StaleBoot, "worker has been fenced");
@@ -979,8 +998,10 @@ void EvolutionCoordinator::handle_frame(const std::shared_ptr<Session>& session,
     }
     case MessageType::ReconcileReport: {
       std::string encoded;
+      CommandScope scope(*this);
       {
         internal::StateLockGuard guard(state_mutex_, state_lock_owner_);
+        scope.begin_locked();
         const EvolutionPlanId plan_id = message.ident<EvolutionPlanIdTag, 63>(f_plan);
         const SchemaGeneration observed =
             message.generation<SchemaGenerationTag>(internal::field_id("state_generation"));
@@ -1050,6 +1071,7 @@ void EvolutionCoordinator::handle_frame(const std::shared_ptr<Session>& session,
         const Status stored = persist(encoded);
         if (stored.is_failure()) result = internal::failure_result(stored);
       }
+      if (result.is_ok()) scope.commit();
       response_type = MessageType::PublishCompletionAck;
       break;
     }
