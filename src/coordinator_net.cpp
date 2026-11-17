@@ -156,9 +156,13 @@ void EvolutionCoordinator::stop() {
     return;
   }
   listener_.close();
+  // The accept thread ends first. It both adds sessions and joins the ones
+  // that have finished, so while it runs it can add a session that
+  // shutdown_sessions() has not seen, or join one that shutdown_sessions() is
+  // joining as well.
+  if (accept_thread_.joinable()) accept_thread_.join();
   shutdown_sessions();
   if (events_ != nullptr) events_->close();
-  if (accept_thread_.joinable()) accept_thread_.join();
   if (event_thread_.joinable()) event_thread_.join();
   listener_port_ = 0;
 }
